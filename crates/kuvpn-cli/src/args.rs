@@ -105,9 +105,14 @@ pub struct Args {
 
     /// Tunnel mode: how traffic is routed through the VPN.
     /// full: all traffic is routed through the VPN (default).
+    /// split: only --split-host uses the VPN (macOS/Linux); other traffic and DNS stay local.
     /// manual: pass your own vpnc-script via --vpnc-script.
     #[arg(long, value_enum, default_value_t = CliTunnelMode::Full)]
     pub tunnel_mode: CliTunnelMode,
+
+    /// IPv4 host routed through the VPN; required in split mode (macOS/Linux only).
+    #[arg(long, required_if_eq("tunnel_mode", "split"))]
+    pub split_host: Option<std::net::Ipv4Addr>,
 
     /// Path to a custom vpnc-script passed to openconnect via --script.
     /// Only used when --tunnel-mode manual is set.
@@ -121,6 +126,53 @@ pub enum CliTunnelMode {
     /// All traffic is routed through the VPN.
     #[default]
     Full,
+    /// Only --split-host uses the VPN; preserve local internet and DNS (macOS/Linux).
+    Split,
     /// Use a custom vpnc-script (supply path via --vpnc-script).
     Manual,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_mode_requires_an_explicit_host() {
+        let error = Args::try_parse_from(["kuvpn", "--tunnel-mode", "split"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--split-host"));
+        for flags in [vec!["kuvpn"], vec!["kuvpn", "--tunnel-mode", "manual"]] {
+            let args = Args::try_parse_from(flags).unwrap();
+            assert!(args.split_host.is_none());
+        }
+        let args = Args::try_parse_from(["kuvpn"]).unwrap();
+        assert!(matches!(args.tunnel_mode, CliTunnelMode::Full));
+    }
+
+    #[test]
+    fn split_host_accepts_only_ipv4_addresses() {
+        let args = Args::try_parse_from([
+            "kuvpn",
+            "--tunnel-mode",
+            "split",
+            "--split-host",
+            "203.0.113.10",
+        ])
+        .unwrap();
+        assert!(matches!(args.tunnel_mode, CliTunnelMode::Split));
+        assert_eq!(args.split_host.unwrap().to_string(), "203.0.113.10");
+        for invalid in ["", "example.com", "::1", "203.0.113.0/24", "1.2.3.4;id"] {
+            assert!(Args::try_parse_from([
+                "kuvpn",
+                "--tunnel-mode",
+                "split",
+                "--split-host",
+                invalid,
+            ])
+            .is_err());
+        }
+    }
 }

@@ -87,7 +87,7 @@ curl -sSfL https://raw.githubusercontent.com/KUACC-VALAR-HPC-KOC-UNIVERSITY/kuvp
 - **Connection history** — past sessions with timestamps, durations, and reconnect counts, in both the GUI History tab and `kuvpn --history`.
 - **Auto-reconnect that watches the tunnel** — detects when the VPN interface itself drops (not just the OpenConnect process) and retries up to 3 times. Stale saved sessions are wiped and re-authenticated automatically.
 - **Conflict detection** — refuses to start if another full-tunnel VPN is already routing your traffic (e.g. a Tailscale exit node), so you don't end up half-connected to two networks.
-- **Routing flexibility** — full tunnel for "everything through KU", or supply your own vpnc-script for split tunneling and custom DNS.
+- **Routing flexibility** — full tunnel for "everything through KU", built-in split tunneling on macOS/Linux for one IPv4 host you choose, or your own vpnc-script for custom routing. Split mode keeps other traffic and DNS on your normal internet connection.
 - **20 themes** — 10 color families (Crimson, Slate, Ocean, Forest, Rose, Violet, Ember, Frost, Sand, Pebble), each with light and dark variants, plus rounding and shadow controls.
 - **Cross-platform** — Linux (x86_64, aarch64), macOS (Intel and Apple Silicon), and Windows (x86_64). OpenConnect and the Wintun driver are bundled in the Windows installer.
 

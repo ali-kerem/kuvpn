@@ -15,6 +15,21 @@ use crate::types::{
 use kuvpn::{ErrorCategory, SessionConfig, VpnSession};
 use std::time::Duration;
 
+fn should_retry_rejected_cookie(
+    already_retried: bool,
+    category: Option<ErrorCategory>,
+    error: &str,
+    logs: &[String],
+) -> bool {
+    !already_retried
+        && category == Some(ErrorCategory::Connection)
+        && error.contains("OpenConnect process exited before tunnel was established")
+        && (error.to_ascii_lowercase().contains("cookie was rejected")
+            || logs
+                .iter()
+                .any(|line| line.to_ascii_lowercase().contains("cookie was rejected")))
+}
+
 /// Returns the window settings used for every window open call.
 pub(super) fn window_settings(use_csd: bool) -> iced::window::Settings {
     // The application_id must match the basename of our .desktop file
@@ -78,6 +93,8 @@ pub struct KuVpnGui {
 
     // VPN Session
     pub session: Option<Arc<VpnSession>>,
+    /// At most one stale-cookie recovery per user-initiated connection.
+    stale_session_retried: bool,
 
     // Tray & Window state
     pub tray_icon: Option<TrayIcon>,
@@ -254,6 +271,14 @@ impl KuVpnGui {
 
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+                // The session may finish between the first drain and status poll.
+                // Preserve its final OpenConnect error before handling recovery.
+                while let Ok(log_msg) = log_rx.try_recv() {
+                    let _ = output.send(Message::LogAppended(log_msg)).await;
+                }
+                while let Ok(log_msg) = gui_rx.try_recv() {
+                    let _ = output.send(Message::LogAppended(log_msg)).await;
+                }
                 let _ = output
                     .send(Message::ConnectionFinished(
                         session_c.last_error(),
@@ -315,6 +340,15 @@ impl KuVpnGui {
             }
         }
 
+        let tunnel_mode = match self.settings.tunnel_mode() {
+            Ok(mode) => mode,
+            Err(err) => {
+                self.error_message = Some(err.to_string());
+                self.status = ConnectionStatus::Error;
+                return Task::none();
+            }
+        };
+
         self.automation_warning = None;
         self.last_diagnostic_path = None;
         self.error_message = None;
@@ -346,15 +380,7 @@ impl KuVpnGui {
             },
             escalation_tool: Some(self.settings.escalation_tool.clone()),
             interface_name: "kuvpn0".to_string(),
-            tunnel_mode: if self.settings.is_manual_mode() {
-                kuvpn::TunnelMode::Manual(if self.settings.vpnc_script.is_empty() {
-                    None
-                } else {
-                    Some(self.settings.vpnc_script.clone())
-                })
-            } else {
-                kuvpn::TunnelMode::Full
-            },
+            tunnel_mode,
         };
 
         let session = Arc::new(VpnSession::new(config));
@@ -398,17 +424,14 @@ impl KuVpnGui {
         if let Some(e) = err {
             self.error_category = category;
 
-            // Auto-recover from a stale DSID caused by a previous force-quit.
-            // OpenConnect exiting immediately before the tunnel is established
-            // often means the server still holds an active session and rejected
-            // the new cookie. Wipe the cached browser session data and retry
-            // once — the guard is that has_session_data() returns false after
-            // a successful wipe, so a second failure won't loop.
-            if matches!(category, Some(kuvpn::ErrorCategory::Connection))
-                && e.contains("OpenConnect process exited before tunnel was established")
+            // A process exit can also mean a sudo, network, or script error.
+            // Only re-authenticate on explicit cookie rejection, and only once.
+            // Profile existence is not a retry limit: every login recreates it.
+            if should_retry_rejected_cookie(self.stale_session_retried, category, &e, &self.logs)
                 && kuvpn::has_session_data()
                 && kuvpn::wipe_user_data_dir().is_ok()
             {
+                self.stale_session_retried = true;
                 self.logs.push(
                     "[INF] Stale session detected — session data cleared. Retrying...".to_string(),
                 );
@@ -576,6 +599,11 @@ impl KuVpnGui {
                 self.save_settings();
                 Task::none()
             }
+            Message::SplitHostChanged(v) => {
+                self.settings.split_host = v;
+                self.save_settings();
+                Task::none()
+            }
             Message::VpncScriptChanged(v) => {
                 self.settings.vpnc_script = v;
                 self.vpnc_script_test_result = None;
@@ -716,13 +744,15 @@ impl KuVpnGui {
             }
             Message::ConnectPressed => {
                 self.logs.clear();
+                self.stale_session_retried = false;
                 self.handle_connect_pressed()
             }
             Message::AutoRetryConnect => {
                 // Auto-retry (e.g. stale session cleared): preserve logs and add a separator
                 // banner so the user can see what happened before the retry started.
-                self.logs
-                    .push("──────────── auto-retry: stale session cleared ────────────".to_string());
+                self.logs.push(
+                    "──────────── auto-retry: stale session cleared ────────────".to_string(),
+                );
                 self.handle_connect_pressed()
             }
             Message::DisconnectPressed => {
@@ -1209,6 +1239,7 @@ impl Default for KuVpnGui {
             notif_fade: 0.0,
             history: Vec::new(),
             session: None,
+            stale_session_retried: false,
             tray_icon: None,
             tray_menu: None,
             window_id: None,
@@ -1227,5 +1258,53 @@ impl Default for KuVpnGui {
                 .ok()
                 .and_then(|d| kuvpn::FileLogger::open(d.join("kuvpn-gui.log"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STARTUP_EXIT: &str = "OpenConnect process exited before tunnel was established";
+
+    #[test]
+    fn startup_failure_without_cookie_rejection_does_not_restart_login() {
+        let logs = vec!["[WRN] sudo: a password is required".to_string()];
+        assert!(!should_retry_rejected_cookie(
+            false,
+            Some(ErrorCategory::Connection),
+            STARTUP_EXIT,
+            &logs,
+        ));
+        assert!(!should_retry_rejected_cookie(
+            false,
+            Some(ErrorCategory::Connection),
+            STARTUP_EXIT,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn rejected_cookie_retries_only_once_per_connect() {
+        let logs = vec!["[WRN] Cookie was rejected by server; exiting.".to_string()];
+        assert!(should_retry_rejected_cookie(
+            false,
+            Some(ErrorCategory::Connection),
+            STARTUP_EXIT,
+            &logs,
+        ));
+        // Recreating the browser profile cannot reset this per-connection guard.
+        assert!(!should_retry_rejected_cookie(
+            true,
+            Some(ErrorCategory::Connection),
+            STARTUP_EXIT,
+            &logs,
+        ));
+        assert!(!should_retry_rejected_cookie(
+            false,
+            Some(ErrorCategory::Authentication),
+            STARTUP_EXIT,
+            &logs,
+        ));
     }
 }

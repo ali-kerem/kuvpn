@@ -13,7 +13,7 @@
 - Live console tab and a connection history tab with durations
 - 10 color families × light/dark variants — 20 themes total
 - Conflict detection — refuses to start if a Tailscale exit node or other full-tunnel VPN is active
-- Tunnel modes: full traffic through VPN, or supply your own vpnc-script
+- Tunnel modes: full traffic through VPN, one-host split tunneling (macOS/Linux), or your own vpnc-script
 
 ---
 
@@ -117,6 +117,15 @@ If you'd like to review or change settings (login mode, theme, advanced options)
 
 To disconnect, click **Disconnect** or use the tray menu.
 
+### Use the VPN only for SSH (macOS / Linux)
+
+1. Disconnect if you are already connected.
+2. Open **Settings**, enable **Advanced**, and set **Tunnel Mode** to **Split**.
+3. Enter your destination's IPv4 address in **Split Host**. This field starts empty and is required in Split mode.
+4. Connect, then SSH to that same address. For example, `ssh your_username@203.0.113.10`, replacing the documentation-only address with your destination.
+
+Only traffic to the selected IP uses the VPN. Other traffic, DNS, and IPv6 retain their existing routing. The setting is saved for future connections, including automatic reconnects. Disconnect and reconnect to apply any changes. The default for existing and new configurations remains **Full**. The built-in **Split** option is currently available on macOS and Linux.
+
 ---
 
 ## Login Modes
@@ -174,7 +183,8 @@ Settings are divided into **Basic** and **Advanced** sections. Use the **Basic /
 | Gateway URL | The VPN portal URL. Default: `https://vpn.ku.edu.tr` |
 | DSID Domain | Domain for DSID cookie matching. Default: `vpn.ku.edu.tr` |
 | OC Path | Path to the `openconnect` binary. Leave blank to auto-detect. Click **Test** to verify. |
-| Tunnel Mode | `Full` routes all traffic through the VPN. `Manual` lets you supply a custom vpnc-script for advanced routing. |
+| Tunnel Mode | `Full` routes all traffic through the VPN. `Split` routes one IPv4 host through the VPN, preserving normal internet and DNS (macOS/Linux). `Manual` lets you supply a custom vpnc-script. Reconnect after changing modes. |
+| Split Host | IPv4 destination for Split mode. Starts empty; you must enter an address. Only shown in Split mode. |
 | VPN Script | Path to a custom vpnc-script (only shown in Manual tunnel mode). Click **Test** to validate before connecting. |
 | Log Level | Controls how much is shown in the Console tab |
 | Elevation | Privilege escalation tool: `sudo` or `pkexec` (Linux/macOS only) |
@@ -208,7 +218,7 @@ Click **Clear** to wipe the history.
 
 If the VPN tunnel drops unexpectedly, KUVPN automatically tries to reconnect up to 3 times with a short delay between each attempt. The status bar shows **Reconnecting... (attempt N/3)**. You can cancel at any time by clicking **Disconnect**.
 
-When a stale session causes the initial tunnel to fail, KUVPN detects it, clears the session data, and retries automatically. A separator line is inserted in the console log so you can see what happened before and after the retry.
+If OpenConnect explicitly reports that the saved cookie was rejected, KUVPN clears the browser session and retries once per click of **Join Network**. Other startup failures are shown as errors instead of restarting login. A separator line is inserted in the console log so you can see what happened before and after the retry.
 
 ---
 

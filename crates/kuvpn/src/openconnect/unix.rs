@@ -336,17 +336,21 @@ impl Drop for TempScript {
     }
 }
 
-/// Generates a full-tunnel vpnc-script, writes it to a temporary file, makes it
+/// Generates a full or split-tunnel vpnc-script, writes it to a temporary file, makes it
 /// executable, and returns a [`TempScript`] handle.
 ///
 /// Handles routing and DNS setup/teardown on both macOS and Linux,
 /// replacing the macOS-specific `networksetup` calls that fail in openconnect's
 /// built-in script.
-pub fn generate_vpnc_script() -> anyhow::Result<TempScript> {
+pub fn generate_vpnc_script(split_host: Option<std::net::Ipv4Addr>) -> anyhow::Result<TempScript> {
+    let contents = match split_host {
+        Some(host) => include_str!("split-tunnel.sh").replace("@SPLIT_HOST@", &host.to_string()),
+        None => VPNC_SCRIPT_TEMPLATE.to_string(),
+    };
     // Pick a unique temp path: /tmp/kuvpn-vpnc-<pid>.sh
     let path = std::env::temp_dir().join(format!("kuvpn-vpnc-{}.sh", std::process::id()));
 
-    std::fs::write(&path, VPNC_SCRIPT_TEMPLATE.as_bytes())?;
+    std::fs::write(&path, contents.as_bytes())?;
 
     // Make executable (rwxr-xr-x)
     #[cfg(unix)]

@@ -3,6 +3,9 @@
 /dist/
 **/*.rs.bk
 
+# Python routing tests
+__pycache__/
+
 # AppImage build artifacts
 *.AppImage
 packaging/appimage/AppDir/

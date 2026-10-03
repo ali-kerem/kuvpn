@@ -373,14 +373,29 @@ impl KuVpnGui {
             col = col.push(self.view_unified_control(
                 "Tunnel Mode:",
                 self.view_segmented_control(
-                    &["Full", "Manual"],
-                    &[1.0, 2.0],
+                    if cfg!(unix) { &["Split", "Full", "Manual"] } else { &["Full", "Manual"] },
+                    if cfg!(unix) { &[0.0, 1.0, 2.0] } else { &[1.0, 2.0] },
                     self.settings.tunnel_mode_val,
                     is_locked,
                     Message::TunnelModeChanged,
                 ),
-                "Full: all traffic is routed through the VPN tunnel.\n\nManual: supply your own vpnc-script for full control over routing and DNS.",
+                "Split (macOS/Linux): only the Split Host uses the VPN; other traffic and DNS use your normal connection.\n\nFull: all traffic is routed through the VPN tunnel.\n\nManual: supply your own vpnc-script for full control over routing and DNS. Changes apply on the next connection.",
             ));
+            if self.settings.is_split_mode() {
+                col = col.push(self.view_unified_field(
+                    "Split Host:",
+                    "Destination IPv4 address",
+                    &self.settings.split_host,
+                    "Only this IPv4 address uses the VPN, including SSH. Everything else uses your normal internet connection. Disconnect and reconnect to apply changes.",
+                    is_locked,
+                    Message::SplitHostChanged,
+                ));
+                col = col.push(
+                    text("Only this host uses the VPN. Other traffic and DNS stay local.")
+                        .size(10)
+                        .color(p.text_muted),
+                );
+            }
             // VPN Script field — visible only in Manual mode
             if self.settings.is_manual_mode() {
                 let script_test = self.vpnc_script_test_result;

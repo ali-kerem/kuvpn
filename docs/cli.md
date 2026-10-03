@@ -111,6 +111,24 @@ That's it for most users. `kuvpn` will open a headless browser, complete the Azu
 
 Press **Ctrl+C** to disconnect.
 
+### Split tunnel for SSH (macOS / Linux)
+
+Choose the IPv4 host you want to reach through the VPN, keeping the rest of your traffic and DNS on your normal connection. Replace the documentation-only address `203.0.113.10` below with your destination:
+
+```bash
+kuvpn --tunnel-mode split --split-host 203.0.113.10
+```
+
+Then, in another terminal:
+
+```bash
+ssh your_username@203.0.113.10
+```
+
+`--split-host` is required in Split mode; there is no default destination. The destination must be a single IPv4 address. All traffic to that address uses the VPN, including SSH; other addresses, DNS, and IPv6 keep their existing routing. Server-provided routes and DNS are ignored in this mode. No extra routing package or custom script is required.
+
+Disconnect any existing VPN session before changing modes. The host route is reapplied on reconnect and removed on disconnect. The default remains `full`; provide `--tunnel-mode split` and `--split-host` each time you want split routing. Split mode is currently available on macOS and Linux, and returns an error on Windows.
+
 ---
 
 ## Options
@@ -128,7 +146,8 @@ Press **Ctrl+C** to disconnect.
 | `--run-command` | | *(auto-detected)* | Override the privilege escalation tool (`sudo`, `pkexec`, or a custom script) |
 | `--openconnect-path` | | `openconnect` | Path or command name for the OpenConnect binary |
 | `--interface-name` | | `kuvpn0` | Name for the TUN interface created by OpenConnect |
-| `--tunnel-mode` | | `full` | Tunnel mode: `full` (all traffic via VPN) or `manual` (custom vpnc-script) |
+| `--tunnel-mode` | | `full` | Tunnel mode: `full` (all traffic via VPN), `split` (one IPv4 host, macOS/Linux), or `manual` (custom vpnc-script) |
+| `--split-host` | | *(none)* | IPv4 destination routed through the VPN; required when `--tunnel-mode split` is selected |
 | `--vpnc-script` | | *(none)* | Path to a custom vpnc-script. Only used when `--tunnel-mode manual` is set; if omitted, OpenConnect's built-in default script is used. |
 
 ---

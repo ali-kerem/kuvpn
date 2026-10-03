@@ -23,6 +23,9 @@ pub struct GuiSettings {
     /// Manual mode uses `vpnc_script` as the script path.
     #[serde(default = "default_tunnel_mode_val")]
     pub tunnel_mode_val: f32,
+    /// IPv4 destination for Split mode. Other traffic and DNS remain local.
+    #[serde(default)]
+    pub split_host: String,
     /// Path to a custom vpnc-script passed via --script to openconnect (advanced).
     /// Only used when `tunnel_mode_val` == 2.0 (Manual).
     #[serde(default)]
@@ -56,6 +59,7 @@ impl Default for GuiSettings {
             advanced_mode: false,
             theme: ThemeConfig::default(),
             tunnel_mode_val: 1.0, // Full tunnel
+            split_host: String::new(),
             vpnc_script: String::new(),
             config_version: Self::CURRENT_VERSION,
         }
@@ -75,6 +79,27 @@ impl GuiSettings {
     /// Returns `true` when the tunnel mode slider is set to Manual (value 2).
     pub fn is_manual_mode(&self) -> bool {
         self.tunnel_mode_val.round() as i32 == 2
+    }
+
+    pub fn is_split_mode(&self) -> bool {
+        self.tunnel_mode_val.round() as i32 == 0
+    }
+
+    pub fn tunnel_mode(&self) -> anyhow::Result<kuvpn::TunnelMode> {
+        if self.is_split_mode() {
+            let host = self.split_host.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Enter the IPv4 address you want to reach through the VPN in Split Host."
+                )
+            })?;
+            Ok(kuvpn::TunnelMode::Split(host))
+        } else if self.is_manual_mode() {
+            Ok(kuvpn::TunnelMode::Manual(
+                (!self.vpnc_script.is_empty()).then(|| self.vpnc_script.clone()),
+            ))
+        } else {
+            Ok(kuvpn::TunnelMode::Full)
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -98,5 +123,50 @@ impl GuiSettings {
             }
         }
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_keep_full_tunnel_without_a_split_host() {
+        let mut old = serde_json::to_value(GuiSettings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("split_host");
+        let settings: GuiSettings = serde_json::from_value(old).unwrap();
+        assert!(settings.split_host.is_empty());
+        assert_eq!(settings.tunnel_mode().unwrap(), kuvpn::TunnelMode::Full);
+    }
+
+    #[test]
+    fn split_mode_requires_a_host_before_connecting() {
+        let mut settings = GuiSettings {
+            tunnel_mode_val: 0.0,
+            ..GuiSettings::default()
+        };
+        for empty in ["", "   "] {
+            settings.split_host = empty.to_string();
+            assert!(settings.tunnel_mode().is_err());
+        }
+    }
+
+    #[test]
+    fn split_settings_persist_and_validate_before_connecting() {
+        let settings = GuiSettings {
+            tunnel_mode_val: 0.0,
+            split_host: " 203.0.113.10 ".to_string(),
+            ..GuiSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let mut loaded: GuiSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.tunnel_mode().unwrap(),
+            kuvpn::TunnelMode::Split("203.0.113.10".parse().unwrap())
+        );
+        loaded.split_host = "not an IP".to_string();
+        assert!(loaded.tunnel_mode().is_err());
+        loaded.tunnel_mode_val = 1.0;
+        assert_eq!(loaded.tunnel_mode().unwrap(), kuvpn::TunnelMode::Full);
     }
 }

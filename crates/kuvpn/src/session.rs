@@ -61,6 +61,8 @@ impl ParsedLog {
 pub enum TunnelMode {
     /// All traffic (0.0.0.0/0) is routed through the tunnel.
     Full,
+    /// Only this IPv4 host uses the VPN; DNS and other traffic stay local (Unix).
+    Split(std::net::Ipv4Addr),
     /// User supplies their own vpnc-script. `None` passes no `--script` flag
     /// (openconnect falls back to its built-in defaults).
     Manual(Option<String>),
@@ -79,7 +81,7 @@ pub struct SessionConfig {
     pub interface_name: String,
     /// Controls routing and DNS setup for the VPN tunnel.
     /// On Unix: Split/Full generate a vpnc-script at runtime; Manual passes a user path.
-    /// On Windows: only Full/Split distinction is used (no script support).
+    /// On Windows: Split is unsupported; Full/Manual retain the existing behavior.
     pub tunnel_mode: TunnelMode,
 }
 
@@ -142,16 +144,34 @@ fn spawn_stream_reader<R: Read + Send + 'static>(
     stream: R,
     level: &'static str,
     logs_tx: Arc<Mutex<Option<crossbeam_channel::Sender<String>>>>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let mut reader = BufReader::new(stream);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    log::warn!("Could not read OpenConnect output: {err}");
+                    break;
+                }
+            }
+            // Verbose protocol dumps can contain non-UTF-8 bytes. `lines()`
+            // would fail and close the pipe, causing OpenConnect to get SIGPIPE
+            // on its next write. Always drain the pipe and decode lossily.
+            let line = String::from_utf8_lossy(&bytes)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
             if let Ok(guard) = logs_tx.lock() {
                 if let Some(tx) = guard.as_ref() {
                     let _ = tx.send(format!("{}|{}", level, line));
                 }
             }
         }
-    });
+    })
 }
 
 struct SessionThread {
@@ -164,6 +184,7 @@ struct SessionThread {
     browser_pid: Arc<Mutex<Option<u32>>>,
     /// Tracks when the VPN connected so we can record session duration.
     connected_at: Option<Instant>,
+    log_readers: Vec<thread::JoinHandle<()>>,
     /// Cached sudo/pkexec password resolved during `start_openconnect`.
     #[cfg(unix)]
     sudo_password: Option<String>,
@@ -184,6 +205,7 @@ impl SessionThread {
             logs_tx: Arc::clone(&s.logs_tx),
             browser_pid: Arc::clone(&s.browser_pid),
             connected_at: None,
+            log_readers: Vec::new(),
             #[cfg(unix)]
             sudo_password: None,
             #[cfg(unix)]
@@ -192,7 +214,12 @@ impl SessionThread {
     }
 
     fn send_log(&self, msg: impl Into<String>) {
-        if let Some(tx) = self.logs_tx.lock().expect("session mutex poisoned").as_ref() {
+        if let Some(tx) = self
+            .logs_tx
+            .lock()
+            .expect("session mutex poisoned")
+            .as_ref()
+        {
             if tx.send(msg.into()).is_err() {
                 log::debug!("Log channel closed; message dropped");
             }
@@ -204,10 +231,12 @@ impl SessionThread {
     }
 
     fn set_conn_error(&self, msg: &str) {
-        *self.status.lock().expect("session mutex poisoned") = ConnectionStatus::Error;
         *self.last_error.lock().expect("session mutex poisoned") = Some(msg.to_string());
-        *self.error_category.lock().expect("session mutex poisoned") = Some(crate::error::ErrorCategory::Connection);
+        *self.error_category.lock().expect("session mutex poisoned") =
+            Some(crate::error::ErrorCategory::Connection);
         self.send_log(format!("Error|{}", msg));
+        // Publish the terminal status after its details are ready for the GUI.
+        self.set_status(ConnectionStatus::Error);
     }
 
     fn clear_browser_pid(&self) {
@@ -231,6 +260,25 @@ impl SessionThread {
     }
 
     fn run(mut self, provider: Arc<dyn CredentialsProvider>) {
+        if matches!(self.config.tunnel_mode, TunnelMode::Split(_)) {
+            #[cfg(not(unix))]
+            {
+                self.set_conn_error(
+                    "Split tunneling is currently supported on macOS and Linux only.",
+                );
+                return;
+            }
+            // An existing process may be using full-tunnel routing. Never silently
+            // adopt it and claim that the requested split configuration is active.
+            #[cfg(unix)]
+            if self.is_vpn_connected() {
+                self.set_conn_error(
+                    "Disconnect the existing VPN connection before starting Split mode.",
+                );
+                return;
+            }
+        }
+
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0u32;
         // Duration (secs) of the session that just ended unexpectedly; attached
@@ -348,7 +396,7 @@ impl SessionThread {
     }
 
     /// Resolves the vpnc-script path for this session.
-    /// On Unix: generates a temp script for Full mode or returns the Manual path.
+    /// On Unix: generates a temp script for Full/Split or returns the Manual path.
     /// On non-Unix: always returns `None` (no script support).
     #[cfg(unix)]
     fn resolve_vpnc_script(&mut self) -> Result<Option<String>, ()> {
@@ -364,16 +412,26 @@ impl SessionThread {
                 }
                 Ok(path.clone())
             }
-            TunnelMode::Full => {
-                // Drop any existing script handle first. Both the old and new
-                // TempScript use the same path (keyed on process PID which never
-                // changes across reconnects). If we let the old handle be dropped
-                // by the assignment below, its Drop impl deletes the file AFTER
-                // the new one has already been written to the same path.
+            TunnelMode::Full | TunnelMode::Split(_) => {
+                // Drop the old script before recreating its process-specific path.
+                // Otherwise its cleanup would delete the newly written script.
                 self.active_script = None;
-                let script =
-                    generate_vpnc_script().map_err(|e| self.set_conn_error(&e.to_string()))?;
-                let path = script.path_str().map(str::to_string);
+                let split_host = match self.config.tunnel_mode {
+                    TunnelMode::Split(host) => Some(host),
+                    _ => None,
+                };
+                let script = generate_vpnc_script(split_host)
+                    .map_err(|e| self.set_conn_error(&e.to_string()))?;
+                let path = Some(
+                    script
+                        .path_str()
+                        .ok_or_else(|| {
+                            self.set_conn_error(
+                                "The generated VPN script path is not valid UTF-8.",
+                            );
+                        })?
+                        .to_string(),
+                );
                 if verbose {
                     if let Some(ref p) = path {
                         self.send_log(format!("Debug|Generated vpnc-script: {}", p));
@@ -467,7 +525,8 @@ impl SessionThread {
             .map_err(|e| self.set_conn_error(&e.to_string()))
     }
 
-    fn spawn_log_readers(&self, proc: &mut VpnProcess) {
+    fn spawn_log_readers(&mut self, proc: &mut VpnProcess) {
+        self.log_readers.clear();
         // In debug/trace mode openconnect runs with --verbose; label its stdout
         // as Debug so the flood of detail doesn't pollute the Info console view.
         let oc_stdout_level = if log::max_level() >= log::LevelFilter::Debug {
@@ -477,11 +536,30 @@ impl SessionThread {
         };
         if let VpnProcess::Unix(ref mut child) = proc {
             if let Some(stdout) = child.stdout.take() {
-                spawn_stream_reader(stdout, oc_stdout_level, Arc::clone(&self.logs_tx));
+                self.log_readers.push(spawn_stream_reader(
+                    stdout,
+                    oc_stdout_level,
+                    Arc::clone(&self.logs_tx),
+                ));
             }
             if let Some(stderr) = child.stderr.take() {
-                spawn_stream_reader(stderr, "Warn", Arc::clone(&self.logs_tx));
+                self.log_readers.push(spawn_stream_reader(
+                    stderr,
+                    "Warn",
+                    Arc::clone(&self.logs_tx),
+                ));
             }
+        }
+    }
+
+    fn finish_log_readers(&self) {
+        // Consume the final cookie-rejection message before the GUI decides
+        // whether to retry. A descendant may keep a pipe open, so bound the wait.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while self.log_readers.iter().any(|reader| !reader.is_finished())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -512,8 +590,11 @@ impl SessionThread {
         //
         // Initialised to `Some(now)` when there is no process (already-up shortcut).
         #[cfg(windows)]
-        let mut connect_phase_start: Option<Instant> =
-            if process.is_none() { Some(Instant::now()) } else { None };
+        let mut connect_phase_start: Option<Instant> = if process.is_none() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         #[cfg(windows)]
         let mut uac_logged = false;
 
@@ -644,6 +725,7 @@ impl SessionThread {
                         let reason = p.failure_reason().unwrap_or_else(|| {
                             "OpenConnect process exited before tunnel was established".to_string()
                         });
+                        self.finish_log_readers();
                         self.set_conn_error(&reason);
                         return None;
                     }
@@ -704,7 +786,11 @@ impl SessionThread {
         } else if *self.status.lock().expect("session mutex poisoned") == ConnectionStatus::Error {
             // An error occurred before ever connecting (auth failure, tunnel timeout, etc.)
             let mut event = crate::history::ConnectionEvent::now(crate::history::EventKind::Error);
-            event.message = self.last_error.lock().expect("session mutex poisoned").clone();
+            event.message = self
+                .last_error
+                .lock()
+                .expect("session mutex poisoned")
+                .clone();
             let _ = crate::history::append_event(&event);
         } else {
             // Never reached the Connected state — record as cancelled, not disconnected.
@@ -745,7 +831,10 @@ impl VpnSession {
     }
 
     fn take_browser_pid(&self) -> Option<u32> {
-        self.browser_pid.lock().expect("session mutex poisoned").take()
+        self.browser_pid
+            .lock()
+            .expect("session mutex poisoned")
+            .take()
     }
 
     fn transition_to_disconnecting(&self) {
@@ -774,7 +863,10 @@ impl VpnSession {
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().expect("session mutex poisoned").clone()
+        self.last_error
+            .lock()
+            .expect("session mutex poisoned")
+            .clone()
     }
 
     pub fn error_category(&self) -> Option<crate::error::ErrorCategory> {
@@ -810,5 +902,36 @@ impl VpnSession {
         }
         let thread = SessionThread::from_session(self);
         thread::spawn(move || thread.run(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_output_does_not_close_the_childs_pipe() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '\\377\\n' >&2; sleep 0.05; printf 'after invalid bytes\\n' >&2",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let reader = spawn_stream_reader(
+            child.stderr.take().unwrap(),
+            "Warn",
+            Arc::new(Mutex::new(Some(tx))),
+        );
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(status.success(), "child failed after a log write: {status}");
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            ["Warn|\u{fffd}", "Warn|after invalid bytes"],
+        );
     }
 }

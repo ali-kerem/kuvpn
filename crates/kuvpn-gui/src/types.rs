@@ -103,6 +103,7 @@ pub enum Message {
     QuitAfterCleanup,
     AutoHideAfterPromptToggled(bool),
     TunnelModeChanged(f32),
+    SplitHostChanged(String),
     VpncScriptChanged(String),
     AutoHideWindow,
     AdvancedModeToggled(bool),
