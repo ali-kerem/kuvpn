@@ -90,9 +90,17 @@ impl VpnProcess {
         }
     }
 
-    /// Returns the failure reason stored by the Windows helper thread, if any.
-    /// Always returns `None` on Unix.
-    pub fn failure_reason(&self) -> Option<String> {
+    /// Returns the exited Unix process's status or the Windows helper's failure.
+    pub fn failure_reason(&mut self) -> Option<String> {
+        if let VpnProcess::Unix(child) = self {
+            return match child.try_wait() {
+                Ok(Some(status)) => Some(format!(
+                    "OpenConnect process exited before tunnel was established ({status})"
+                )),
+                Err(err) => Some(format!("Could not check OpenConnect process: {err}")),
+                Ok(None) => None,
+            };
+        }
         #[cfg(windows)]
         if let VpnProcess::Windows {
             thread_failed_reason,

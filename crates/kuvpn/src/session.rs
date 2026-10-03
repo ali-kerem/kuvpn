@@ -4,6 +4,7 @@ use crate::openconnect::{
     OpenConnectRunner, VpnProcess,
 };
 use crate::utils::{CancellationToken, CredentialsProvider};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -144,6 +145,7 @@ fn spawn_stream_reader<R: Read + Send + 'static>(
     stream: R,
     level: &'static str,
     logs_tx: Arc<Mutex<Option<crossbeam_channel::Sender<String>>>>,
+    error_output: Option<Arc<Mutex<VecDeque<String>>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
@@ -165,6 +167,22 @@ fn spawn_stream_reader<R: Read + Send + 'static>(
             let line = String::from_utf8_lossy(&bytes)
                 .trim_end_matches(['\r', '\n'])
                 .to_string();
+            if let Some(ref output) = error_output {
+                let lower = line.to_ascii_lowercase();
+                // Error summaries are persisted in history. Exclude credential headers.
+                if !lower.contains("dsid=")
+                    && !lower.contains("cookie:")
+                    && !lower.contains("authorization:")
+                    && !line.trim().is_empty()
+                {
+                    if let Ok(mut tail) = output.lock() {
+                        if tail.len() == 8 {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line.clone());
+                    }
+                }
+            }
             if let Ok(guard) = logs_tx.lock() {
                 if let Some(tx) = guard.as_ref() {
                     let _ = tx.send(format!("{}|{}", level, line));
@@ -184,6 +202,7 @@ struct SessionThread {
     browser_pid: Arc<Mutex<Option<u32>>>,
     /// Tracks when the VPN connected so we can record session duration.
     connected_at: Option<Instant>,
+    process_error_output: Arc<Mutex<VecDeque<String>>>,
     log_readers: Vec<thread::JoinHandle<()>>,
     /// Cached sudo/pkexec password resolved during `start_openconnect`.
     #[cfg(unix)]
@@ -205,6 +224,7 @@ impl SessionThread {
             logs_tx: Arc::clone(&s.logs_tx),
             browser_pid: Arc::clone(&s.browser_pid),
             connected_at: None,
+            process_error_output: Arc::new(Mutex::new(VecDeque::new())),
             log_readers: Vec::new(),
             #[cfg(unix)]
             sudo_password: None,
@@ -526,6 +546,7 @@ impl SessionThread {
     }
 
     fn spawn_log_readers(&mut self, proc: &mut VpnProcess) {
+        self.process_error_output = Arc::new(Mutex::new(VecDeque::new()));
         self.log_readers.clear();
         // In debug/trace mode openconnect runs with --verbose; label its stdout
         // as Debug so the flood of detail doesn't pollute the Info console view.
@@ -540,6 +561,7 @@ impl SessionThread {
                     stdout,
                     oc_stdout_level,
                     Arc::clone(&self.logs_tx),
+                    Some(Arc::clone(&self.process_error_output)),
                 ));
             }
             if let Some(stderr) = child.stderr.take() {
@@ -547,19 +569,33 @@ impl SessionThread {
                     stderr,
                     "Warn",
                     Arc::clone(&self.logs_tx),
+                    Some(Arc::clone(&self.process_error_output)),
                 ));
             }
         }
     }
 
-    fn finish_log_readers(&self) {
-        // Consume the final cookie-rejection message before the GUI decides
-        // whether to retry. A descendant may keep a pipe open, so bound the wait.
+    fn process_startup_error(&self, reason: String) -> String {
+        // Let pipe readers consume the final error before publishing a terminal
+        // status. Bound the wait in case a descendant is keeping a pipe open.
         let deadline = Instant::now() + Duration::from_millis(250);
         while self.log_readers.iter().any(|reader| !reader.is_finished())
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(10));
+        }
+        let output = self
+            .process_error_output
+            .lock()
+            .expect("session mutex poisoned");
+        if output.is_empty() {
+            reason
+        } else {
+            format!(
+                "{}\n\n{}",
+                reason,
+                output.iter().cloned().collect::<Vec<_>>().join("\n")
+            )
         }
     }
 
@@ -725,8 +761,7 @@ impl SessionThread {
                         let reason = p.failure_reason().unwrap_or_else(|| {
                             "OpenConnect process exited before tunnel was established".to_string()
                         });
-                        self.finish_log_readers();
-                        self.set_conn_error(&reason);
+                        self.set_conn_error(&self.process_startup_error(reason));
                         return None;
                     }
                 }
@@ -925,6 +960,7 @@ mod tests {
             child.stderr.take().unwrap(),
             "Warn",
             Arc::new(Mutex::new(Some(tx))),
+            None,
         );
         let status = child.wait().unwrap();
         reader.join().unwrap();
@@ -933,5 +969,46 @@ mod tests {
             rx.try_iter().collect::<Vec<_>>(),
             ["Warn|\u{fffd}", "Warn|after invalid bytes"],
         );
+    }
+
+    #[test]
+    fn process_output_keeps_final_error_and_excludes_cookie_headers() {
+        let output = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut text = (0..12)
+            .map(|i| format!("progress {i}\n"))
+            .collect::<String>();
+        text.push_str("Cookie: DSID=secret-cookie\nAuthorization: secret-header\n");
+        text.push_str("sudo: a password is required\n");
+        let reader = spawn_stream_reader(
+            std::io::Cursor::new(text),
+            "Warn",
+            Arc::new(Mutex::new(Some(tx))),
+            Some(Arc::clone(&output)),
+        );
+        reader.join().unwrap();
+        let output = output.lock().unwrap();
+        assert_eq!(output.len(), 8);
+        assert_eq!(output.back().unwrap(), "sudo: a password is required");
+        assert!(!output.iter().any(|line| line.contains("secret")));
+        assert_eq!(
+            rx.try_iter().last().unwrap(),
+            "Warn|sudo: a password is required"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_failure_reports_exit_status() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .unwrap();
+        let mut process = VpnProcess::Unix(child);
+        process.wait().unwrap();
+        assert!(!process.is_process_alive());
+        let error = process.failure_reason().unwrap();
+        assert!(error.contains("OpenConnect process exited before tunnel was established"));
+        assert!(error.contains("23"));
     }
 }
