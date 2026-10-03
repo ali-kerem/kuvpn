@@ -343,23 +343,24 @@ impl Drop for TempScript {
 /// replacing the macOS-specific `networksetup` calls that fail in openconnect's
 /// built-in script.
 pub fn generate_vpnc_script(split_host: Option<std::net::Ipv4Addr>) -> anyhow::Result<TempScript> {
+    use std::os::unix::fs::OpenOptionsExt;
     let contents = match split_host {
         Some(host) => include_str!("split-tunnel.sh").replace("@SPLIT_HOST@", &host.to_string()),
         None => VPNC_SCRIPT_TEMPLATE.to_string(),
     };
-    // Pick a unique temp path: /tmp/kuvpn-vpnc-<pid>.sh
-    let path = std::env::temp_dir().join(format!("kuvpn-vpnc-{}.sh", std::process::id()));
-
-    std::fs::write(&path, contents.as_bytes())?;
-
-    // Make executable (rwxr-xr-x)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    Ok(TempScript { path })
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("kuvpn-vpnc-{}-{nonce}.sh", std::process::id()));
+    // Open atomically and refuse existing files/symlinks: this script runs elevated.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    let script = TempScript { path };
+    file.write_all(contents.as_bytes())?;
+    Ok(script)
 }
 
 /// Full-tunnel vpnc-script template.
@@ -637,4 +638,30 @@ fn detect_active_utun() -> Option<String> {
 fn is_cgnat_address(addr: std::net::Ipv4Addr) -> bool {
     let [a, b, ..] = addr.octets();
     a == 100 && (64..=127).contains(&b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn generated_scripts_are_private_and_cleaned_up_independently() {
+        let full = generate_vpnc_script(None).unwrap();
+        let split = generate_vpnc_script(Some("203.0.113.10".parse().unwrap())).unwrap();
+        let full_path = full.path.clone();
+        let split_path = split.path.clone();
+        assert_ne!(full_path, split_path);
+        for path in [&full_path, &split_path] {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+
+        drop(full);
+        assert!(!full_path.exists());
+        assert!(split_path.exists());
+        drop(split);
+        assert!(!split_path.exists());
+    }
 }

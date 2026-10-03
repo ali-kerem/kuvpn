@@ -433,8 +433,6 @@ impl SessionThread {
                 Ok(path.clone())
             }
             TunnelMode::Full | TunnelMode::Split(_) => {
-                // Drop the old script before recreating its process-specific path.
-                // Otherwise its cleanup would delete the newly written script.
                 self.active_script = None;
                 let split_host = match self.config.tunnel_mode {
                     TunnelMode::Split(host) => Some(host),
