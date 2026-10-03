@@ -218,7 +218,7 @@ Click **Clear** to wipe the history.
 
 If the VPN tunnel drops unexpectedly, KUVPN automatically tries to reconnect up to 3 times with a short delay between each attempt. The status bar shows **Reconnecting... (attempt N/3)**. You can cancel at any time by clicking **Disconnect**.
 
-If OpenConnect explicitly reports that the saved cookie was rejected, KUVPN clears the browser session and retries once per click of **Join Network**. Other startup failures are shown as errors instead of restarting login. A separator line is inserted in the console log so you can see what happened before and after the retry.
+If OpenConnect explicitly reports that the saved cookie was rejected, KUVPN clears the browser session and retries once per click of **Join Network**. Settings and logs are preserved. Other startup failures are shown as errors instead of restarting login. A separator line is inserted in the console log so you can see what happened before and after the retry.
 
 ---
 

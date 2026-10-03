@@ -162,17 +162,30 @@ pub fn get_user_data_dir() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 /// Returns `true` if the profile directory exists and contains at least one entry,
-/// indicating that a real browser session has been saved.
+/// indicating that browser session data has been saved. App settings/logs do not count.
 /// Does NOT create the directory.
 pub fn has_session_data() -> bool {
     profile_dir_path()
         .ok()
         .and_then(|p| std::fs::read_dir(p).ok())
-        .and_then(|mut d| d.next())
-        .is_some()
+        .is_some_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| !is_app_data_file(&entry.path()))
+        })
 }
 
-/// Removes the profile directory. Does not create it first.
+fn is_app_data_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "gui_settings.json" | "kuvpn.log" | "kuvpn.log.1" | "kuvpn-gui.log" | "kuvpn-gui.log.1"
+        )
+    )
+}
+
+/// Removes browser session data, preserving KUVPN settings and diagnostic logs.
+/// Does not create the directory first.
 /// Uses path-component checks to guard against wiping unrelated directories.
 pub fn wipe_user_data_dir() -> Result<(), Box<dyn Error>> {
     let path = profile_dir_path()?;
@@ -180,8 +193,24 @@ pub fn wipe_user_data_dir() -> Result<(), Box<dyn Error>> {
         return Err("Refusing to wipe: path does not appear to be a kuvpn directory".into());
     }
     if path.exists() {
-        std::fs::remove_dir_all(&path)?;
-        log::info!("Wiped profile directory: {:?}", path);
+        clear_browser_profile(&path)?;
+        log::info!("Cleared browser session in: {:?}", path);
+    }
+    Ok(())
+}
+
+fn clear_browser_profile(path: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if is_app_data_file(&entry.path()) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            // Remove symlinks themselves, not their targets (Chrome singleton files).
+            std::fs::remove_file(entry.path())?;
+        }
     }
     Ok(())
 }
@@ -193,4 +222,55 @@ pub fn js_escape(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestProfile(PathBuf);
+    impl Drop for TestProfile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn clearing_session_preserves_settings_and_open_log_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile = TestProfile(
+            std::env::temp_dir()
+                .join(format!("kuvpn-profile-test-{}-{nonce}", std::process::id(),)),
+        );
+        std::fs::create_dir(&profile.0).unwrap();
+        std::fs::create_dir(profile.0.join("Default")).unwrap();
+        std::fs::write(profile.0.join("Default/Cookies"), "test session").unwrap();
+        std::fs::write(profile.0.join("Local State"), "browser state").unwrap();
+        std::fs::write(profile.0.join("gui_settings.json"), "saved settings").unwrap();
+        std::fs::write(profile.0.join("kuvpn-gui.log.1"), "previous log").unwrap();
+        let log_path = profile.0.join("kuvpn-gui.log");
+        let mut logger = crate::FileLogger::open(log_path.clone()).unwrap();
+        logger.write_line("before clearing session");
+
+        clear_browser_profile(&profile.0).unwrap();
+        logger.write_line("after clearing session");
+        assert!(!profile.0.join("Default").exists());
+        assert!(!profile.0.join("Local State").exists());
+        assert_eq!(
+            std::fs::read_to_string(profile.0.join("gui_settings.json")).unwrap(),
+            "saved settings"
+        );
+        assert!(profile.0.join("kuvpn-gui.log.1").exists());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("before clearing session"));
+        assert!(log.contains("after clearing session"));
+        assert!(std::fs::read_dir(&profile.0)
+            .unwrap()
+            .all(|entry| is_app_data_file(&entry.unwrap().path())));
+        // A repeated cleanup is safe and still preserves the app files.
+        clear_browser_profile(&profile.0).unwrap();
+    }
 }
