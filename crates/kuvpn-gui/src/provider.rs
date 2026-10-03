@@ -97,3 +97,40 @@ impl GuiProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_connection_dismisses_a_pending_prompt() {
+        let (interaction_tx, mut interaction_rx) = mpsc::channel(4);
+        let token = CancellationToken::new();
+        let provider = GuiProvider {
+            interaction_tx,
+            cancel_token: token.clone(),
+            page_guard: Mutex::new(None),
+        };
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            result_tx
+                .send(provider.request_password("Test password"))
+                .unwrap();
+        });
+        let Some(GuiInteraction::Request(_request)) = interaction_rx.blocking_recv() else {
+            panic!("expected a password prompt");
+        };
+        token.cancel();
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            interaction_rx.blocking_recv(),
+            Some(GuiInteraction::DismissPrompt)
+        ));
+        worker.join().unwrap();
+    }
+}

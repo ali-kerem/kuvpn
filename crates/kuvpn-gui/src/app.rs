@@ -221,7 +221,7 @@ impl KuVpnGui {
 
                 let provider = Arc::new(GuiProvider {
                     interaction_tx,
-                    cancel_token: kuvpn::utils::CancellationToken::new(),
+                    cancel_token: session.cancel_token(),
                     page_guard: std::sync::Mutex::new(None),
                 });
 
