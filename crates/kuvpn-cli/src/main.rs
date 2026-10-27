@@ -357,10 +357,7 @@ fn run_vpn_session(args: &Args, styles: &CliStyles) -> ExitCode {
         interface_name: args.interface_name.clone(),
         tunnel_mode: match args.tunnel_mode {
             args::CliTunnelMode::Full => kuvpn::TunnelMode::Full,
-            args::CliTunnelMode::Split => kuvpn::TunnelMode::Split(
-                args.split_host
-                    .expect("clap requires --split-host in split mode"),
-            ),
+            args::CliTunnelMode::Split => kuvpn::TunnelMode::Split(args.split_host.clone()),
             args::CliTunnelMode::Manual => kuvpn::TunnelMode::Manual(args.vpnc_script.clone()),
         },
     };

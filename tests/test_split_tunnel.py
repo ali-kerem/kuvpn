@@ -13,6 +13,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "crates/kuvpn/src/openconnect/split-tunnel.sh"
 HOST = "203.0.113.10"
+HOSTS = (HOST, "198.51.100.20", "192.0.2.30")
 MOCK = r'''
 import json
 import os
@@ -29,25 +30,32 @@ with open(os.environ["TEST_LOG"], "a") as log:
 if name in ("scutil", "resolvectl", "networksetup"):
     sys.exit("Split mode must never change DNS or IPv6")
 state = Path(os.environ["TEST_ROUTE"])
+routes = json.loads(state.read_text()) if state.exists() else {}
 if name == "route":
     action = args[1]
+    host = args[2] if action == "get" else args[3]
     if action == "add":
-        if state.exists() or os.environ.get("FAIL_ROUTE"):
+        if host in routes or os.environ.get("FAIL_ROUTE") or os.environ.get("FAIL_HOST") == host:
             sys.exit(1)
-        state.write_text(args[-1])
+        routes[host] = args[-1]
     elif action == "get":
-        print("interface: " + (state.read_text() if state.exists() else "en0"))
+        print("interface: " + routes.get(host, "en0"))
     elif action == "delete":
-        if state.exists() and state.read_text() == args[-1]:
-            state.unlink()
+        if routes.get(host) == args[-1]:
+            del routes[host]
 elif name == "ip" and args[0] == "route":
+    host = args[2].split('/')[0]
     if args[1] == "replace":
-        if os.environ.get("FAIL_ROUTE"):
+        if os.environ.get("FAIL_ROUTE") or os.environ.get("FAIL_HOST") == host:
             sys.exit(1)
-        state.write_text(args[-1])
+        routes[host] = args[-1]
     elif args[1] == "del":
-        if state.exists() and state.read_text() == args[-1]:
-            state.unlink()
+        if routes.get(host) == args[-1]:
+            del routes[host]
+if routes:
+    state.write_text(json.dumps(routes))
+elif state.exists():
+    state.unlink()
 '''
 
 
@@ -57,7 +65,7 @@ class SplitTunnelTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.script = self.root / "split.sh"
-        self.script.write_text(SCRIPT.read_text().replace("@SPLIT_HOST@", HOST))
+        self.configure_hosts([HOST])
         self.log = self.root / "commands.jsonl"
         self.route = self.root / "route-state"
         for name in ["uname", "route", "ip", "ifconfig", "scutil", "resolvectl", "networksetup"]:
@@ -92,6 +100,12 @@ class SplitTunnelTests(unittest.TestCase):
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
+    def configure_hosts(self, hosts):
+        self.script.write_text(SCRIPT.read_text().replace("@SPLIT_HOSTS@", " ".join(hosts)))
+
+    def routes(self):
+        return json.loads(self.route.read_text()) if self.route.exists() else {}
+
     def test_posix_shell_syntax(self):
         subprocess.run(["/bin/sh", "-n", str(self.script)], check=True)
 
@@ -99,7 +113,7 @@ class SplitTunnelTests(unittest.TestCase):
         for reason in ["connect", "reconnect"]:
             result = self.run_script("Darwin", reason)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.route.read_text(), "kuvpn-test0")
+            self.assertEqual(self.routes(), {HOST: "kuvpn-test0"})
         result = self.run_script("Darwin", "disconnect")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.route.exists())
@@ -118,7 +132,7 @@ class SplitTunnelTests(unittest.TestCase):
         for reason in ["connect", "reconnect"]:
             result = self.run_script("Linux", reason)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.route.read_text(), "kuvpn-test0")
+            self.assertEqual(self.routes(), {HOST: "kuvpn-test0"})
         result = self.run_script("Linux", "disconnect")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.route.exists())
@@ -133,14 +147,70 @@ class SplitTunnelTests(unittest.TestCase):
         ])
 
     def test_macos_conflicting_host_route_is_preserved(self):
-        self.route.write_text("en0")
+        self.route.write_text(json.dumps({HOST: "en0"}))
         result = self.run_script("Darwin", "connect")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.route.read_text(), "en0")
+        self.assertEqual(self.routes(), {HOST: "en0"})
         self.assertIn("failed to configure", result.stderr)
         self.assertEqual(self.commands()[-1], ["ifconfig", "kuvpn-test0", "down"])
         self.assertEqual(self.run_script("Darwin", "disconnect").returncode, 0)
-        self.assertEqual(self.route.read_text(), "en0")
+        self.assertEqual(self.routes(), {HOST: "en0"})
+
+    def test_multiple_hosts_connect_reconnect_and_disconnect(self):
+        self.configure_hosts(HOSTS)
+        for platform in ["Darwin", "Linux"]:
+            with self.subTest(platform=platform):
+                self.log.unlink(missing_ok=True)
+                for reason in ["connect", "reconnect"]:
+                    result = self.run_script(platform, reason)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.routes(), dict.fromkeys(HOSTS, "kuvpn-test0"))
+                self.assertEqual(self.run_script(platform, "disconnect").returncode, 0)
+                self.assertEqual(self.routes(), {})
+                if platform == "Darwin":
+                    added = [cmd[4] for cmd in self.commands() if cmd[:3] == ["route", "-n", "add"]]
+                    deleted = [cmd[4] for cmd in self.commands() if cmd[:3] == ["route", "-n", "delete"]]
+                else:
+                    added = [cmd[3].split('/')[0] for cmd in self.commands() if cmd[:3] == ["ip", "route", "replace"]]
+                    deleted = [cmd[3].split('/')[0] for cmd in self.commands() if cmd[:3] == ["ip", "route", "del"]]
+                self.assertEqual(added, list(HOSTS) * 2)
+                self.assertEqual(deleted, list(HOSTS))
+
+    def test_partial_route_failure_rolls_back_successful_routes(self):
+        self.configure_hosts(HOSTS)
+        unrelated = {"203.0.113.99": "en0"}
+        for platform in ["Darwin", "Linux"]:
+            with self.subTest(platform=platform):
+                self.route.write_text(json.dumps(unrelated))
+                result = self.run_script(platform, "connect", FAIL_HOST=HOSTS[1])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.routes(), unrelated)
+                self.assertEqual(self.commands()[-1][-1], "down")
+
+    def test_conflict_on_second_macos_host_is_preserved_during_rollback(self):
+        self.configure_hosts(HOSTS)
+        conflict = {HOSTS[1]: "en0"}
+        self.route.write_text(json.dumps(conflict))
+        result = self.run_script("Darwin", "connect")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.routes(), conflict)
+
+    def test_disconnect_preserves_routes_moved_to_another_interface(self):
+        self.configure_hosts(HOSTS)
+        for platform in ["Darwin", "Linux"]:
+            with self.subTest(platform=platform):
+                self.route.write_text(json.dumps(dict.fromkeys(HOSTS, "kuvpn-test0")))
+                routes = self.routes()
+                routes[HOSTS[1]] = "en0"
+                self.route.write_text(json.dumps(routes))
+                self.assertEqual(self.run_script(platform, "disconnect").returncode, 0)
+                self.assertEqual(self.routes(), {HOSTS[1]: "en0"})
+
+    def test_empty_destination_list_is_rejected_before_network_changes(self):
+        self.configure_hosts([])
+        for platform in ["Darwin", "Linux"]:
+            self.assertNotEqual(self.run_script(platform, "connect").returncode, 0)
+            self.assertEqual(self.commands(), [])
 
     def test_failed_route_configuration_does_not_leave_interface_up(self):
         for platform in ["Darwin", "Linux"]:

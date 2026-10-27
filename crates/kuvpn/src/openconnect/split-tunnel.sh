@@ -1,6 +1,6 @@
 #!/bin/sh
-# KUVPN host-only split tunnel. The placeholder is replaced with a parsed IPv4 address.
-SPLIT_HOST='@SPLIT_HOST@'
+# KUVPN host-only split tunnel. Destinations are parsed IPv4 addresses, space-separated.
+SPLIT_HOSTS='@SPLIT_HOSTS@'
 OS="$(uname -s)"
 
 # Deliberately ignore server-provided routes, DNS, domains, and IPv6 settings.
@@ -15,28 +15,31 @@ setup_interface() {
     fi
 }
 
-setup_route() {
-    if [ "$OS" = "Darwin" ]; then
-        # Reconnect can leave the host route in place. Accept it only if it
-        # already belongs to this tunnel; do not replace another interface's route.
-        route -n add -host "$SPLIT_HOST" -interface "$TUNDEV" || {
-            current_if=$(route -n get "$SPLIT_HOST" | awk '/interface:/{print $2}')
-            [ "$current_if" = "$TUNDEV" ]
-        }
-    else
-        ip route replace "$SPLIT_HOST/32" dev "$TUNDEV"
-    fi
+setup_routes() {
+    for split_host in $SPLIT_HOSTS; do
+        if [ "$OS" = "Darwin" ]; then
+            # Reconnect can leave host routes in place. Accept only this tunnel's routes.
+            route -n add -host "$split_host" -interface "$TUNDEV" || {
+                current_if=$(route -n get "$split_host" | awk '/interface:/{print $2}')
+                [ "$current_if" = "$TUNDEV" ] || return 1
+            }
+        else
+            ip route replace "$split_host/32" dev "$TUNDEV" || return 1
+        fi
+    done
 }
 
-teardown_route() {
-    if [ "$OS" = "Darwin" ]; then
-        current_if=$(route -n get "$SPLIT_HOST" 2>/dev/null | awk '/interface:/{print $2}')
-        if [ "$current_if" = "$TUNDEV" ]; then
-            route -n delete -host "$SPLIT_HOST" -interface "$TUNDEV" 2>/dev/null || true
+teardown_routes() {
+    for split_host in $SPLIT_HOSTS; do
+        if [ "$OS" = "Darwin" ]; then
+            current_if=$(route -n get "$split_host" 2>/dev/null | awk '/interface:/{print $2}')
+            if [ "$current_if" = "$TUNDEV" ]; then
+                route -n delete -host "$split_host" -interface "$TUNDEV" 2>/dev/null || true
+            fi
+        else
+            ip route del "$split_host/32" dev "$TUNDEV" 2>/dev/null || true
         fi
-    else
-        ip route del "$SPLIT_HOST/32" dev "$TUNDEV" 2>/dev/null || true
-    fi
+    done
 }
 
 teardown_interface() {
@@ -50,18 +53,19 @@ teardown_interface() {
 
 case "$reason" in
     connect|reconnect)
-        if [ -z "$TUNDEV" ] || [ -z "$INTERNAL_IP4_ADDRESS" ]; then
-            echo "KUVPN split tunnel: missing interface or IPv4 address" >&2
+        if [ -z "$TUNDEV" ] || [ -z "$INTERNAL_IP4_ADDRESS" ] || [ -z "$SPLIT_HOSTS" ]; then
+            echo "KUVPN split tunnel: missing interface, VPN IPv4 address, or destinations" >&2
             exit 1
         fi
-        if ! setup_interface || ! setup_route; then
-            echo "KUVPN split tunnel: failed to configure the host route" >&2
+        if ! setup_interface || ! setup_routes; then
+            echo "KUVPN split tunnel: failed to configure host routes" >&2
+            teardown_routes
             teardown_interface
             exit 1
         fi
         ;;
     disconnect)
-        teardown_route
+        teardown_routes
         teardown_interface
         ;;
     pre-init|attempt-reconnect)

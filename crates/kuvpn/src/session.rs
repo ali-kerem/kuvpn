@@ -62,8 +62,8 @@ impl ParsedLog {
 pub enum TunnelMode {
     /// All traffic (0.0.0.0/0) is routed through the tunnel.
     Full,
-    /// Only this IPv4 host uses the VPN; DNS and other traffic stay local (Unix).
-    Split(std::net::Ipv4Addr),
+    /// IPv4 addresses or hostnames resolved before connecting; other traffic stays local.
+    Split(Vec<String>),
     /// User supplies their own vpnc-script. `None` passes no `--script` flag
     /// (openconnect falls back to its built-in defaults).
     Manual(Option<String>),
@@ -204,6 +204,8 @@ struct SessionThread {
     connected_at: Option<Instant>,
     process_error_output: Arc<Mutex<VecDeque<String>>>,
     log_readers: Vec<thread::JoinHandle<()>>,
+    #[cfg(unix)]
+    resolved_split_hosts: Option<Vec<std::net::Ipv4Addr>>,
     /// Cached sudo/pkexec password resolved during `start_openconnect`.
     #[cfg(unix)]
     sudo_password: Option<String>,
@@ -226,6 +228,8 @@ impl SessionThread {
             connected_at: None,
             process_error_output: Arc::new(Mutex::new(VecDeque::new())),
             log_readers: Vec::new(),
+            #[cfg(unix)]
+            resolved_split_hosts: None,
             #[cfg(unix)]
             sudo_password: None,
             #[cfg(unix)]
@@ -280,7 +284,11 @@ impl SessionThread {
     }
 
     fn run(mut self, provider: Arc<dyn CredentialsProvider>) {
-        if matches!(self.config.tunnel_mode, TunnelMode::Split(_)) {
+        if let TunnelMode::Split(hosts) = &self.config.tunnel_mode {
+            if hosts.is_empty() {
+                self.set_conn_error("Enter at least one split destination.");
+                return;
+            }
             #[cfg(not(unix))]
             {
                 self.set_conn_error(
@@ -296,6 +304,22 @@ impl SessionThread {
                     "Disconnect the existing VPN connection before starting Split mode.",
                 );
                 return;
+            }
+            #[cfg(unix)]
+            {
+                self.send_log("Info|Resolving split-tunnel destinations...");
+                let resolved = crate::split_hosts::resolve_split_hosts(hosts);
+                if self.cancel_token.is_cancelled() {
+                    self.set_status(ConnectionStatus::Disconnected);
+                    return;
+                }
+                match resolved {
+                    Ok(addresses) => self.resolved_split_hosts = Some(addresses),
+                    Err(error) => {
+                        self.set_conn_error(&error);
+                        return;
+                    }
+                }
             }
         }
 
@@ -434,11 +458,15 @@ impl SessionThread {
             }
             TunnelMode::Full | TunnelMode::Split(_) => {
                 self.active_script = None;
-                let split_host = match self.config.tunnel_mode {
-                    TunnelMode::Split(host) => Some(host),
+                let split_hosts = match &self.config.tunnel_mode {
+                    TunnelMode::Split(_) => {
+                        Some(self.resolved_split_hosts.as_deref().ok_or_else(|| {
+                            self.set_conn_error("Split destinations have not been resolved.");
+                        })?)
+                    }
                     _ => None,
                 };
-                let script = generate_vpnc_script(split_host)
+                let script = generate_vpnc_script(split_hosts)
                     .map_err(|e| self.set_conn_error(&e.to_string()))?;
                 let path = Some(
                     script

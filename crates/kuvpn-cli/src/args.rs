@@ -110,9 +110,9 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = CliTunnelMode::Full)]
     pub tunnel_mode: CliTunnelMode,
 
-    /// IPv4 host routed through the VPN; required in split mode (macOS/Linux only).
-    #[arg(long, required_if_eq("tunnel_mode", "split"))]
-    pub split_host: Option<std::net::Ipv4Addr>,
+    /// IPv4 addresses or hostnames routed through the VPN, separated by commas.
+    #[arg(long, required_if_eq("tunnel_mode", "split"), value_delimiter = ',', value_parser = kuvpn::parse_split_host)]
+    pub split_host: Vec<String>,
 
     /// Path to a custom vpnc-script passed to openconnect via --script.
     /// Only used when --tunnel-mode manual is set.
@@ -146,14 +146,14 @@ mod tests {
         assert!(error.to_string().contains("--split-host"));
         for flags in [vec!["kuvpn"], vec!["kuvpn", "--tunnel-mode", "manual"]] {
             let args = Args::try_parse_from(flags).unwrap();
-            assert!(args.split_host.is_none());
+            assert!(args.split_host.is_empty());
         }
         let args = Args::try_parse_from(["kuvpn"]).unwrap();
         assert!(matches!(args.tunnel_mode, CliTunnelMode::Full));
     }
 
     #[test]
-    fn split_host_accepts_only_ipv4_addresses() {
+    fn split_host_rejects_invalid_destinations() {
         let args = Args::try_parse_from([
             "kuvpn",
             "--tunnel-mode",
@@ -163,8 +163,19 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(args.tunnel_mode, CliTunnelMode::Split));
-        assert_eq!(args.split_host.unwrap().to_string(), "203.0.113.10");
-        for invalid in ["", "example.com", "::1", "203.0.113.0/24", "1.2.3.4;id"] {
+        assert_eq!(args.split_host[0], "203.0.113.10");
+        for invalid in [
+            "",
+            "::1",
+            "203.0.113.0/24",
+            "1.2.3.4;id",
+            "203.0.113.10,",
+            "203.0.113.10,,198.51.100.20",
+            "203.0.113.10,bad host",
+            "https://ssh.example.test",
+            "ssh.example.test:22",
+            "999.0.0.1",
+        ] {
             assert!(Args::try_parse_from([
                 "kuvpn",
                 "--tunnel-mode",
@@ -174,5 +185,23 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn split_hosts_accept_commas_spaces_and_repeated_flags() {
+        let args = Args::try_parse_from([
+            "kuvpn",
+            "--tunnel-mode",
+            "split",
+            "--split-host",
+            "203.0.113.10, SSH.Example.Test",
+            "--split-host",
+            "192.0.2.30",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.split_host,
+            ["203.0.113.10", "ssh.example.test", "192.0.2.30"]
+        );
     }
 }

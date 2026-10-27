@@ -342,10 +342,29 @@ impl Drop for TempScript {
 /// Handles routing and DNS setup/teardown on both macOS and Linux,
 /// replacing the macOS-specific `networksetup` calls that fail in openconnect's
 /// built-in script.
-pub fn generate_vpnc_script(split_host: Option<std::net::Ipv4Addr>) -> anyhow::Result<TempScript> {
+pub fn generate_vpnc_script(
+    split_hosts: Option<&[std::net::Ipv4Addr]>,
+) -> anyhow::Result<TempScript> {
     use std::os::unix::fs::OpenOptionsExt;
-    let contents = match split_host {
-        Some(host) => include_str!("split-tunnel.sh").replace("@SPLIT_HOST@", &host.to_string()),
+    let contents = match split_hosts {
+        Some(hosts) => {
+            anyhow::ensure!(
+                !hosts.is_empty(),
+                "Split tunneling requires at least one IPv4 destination."
+            );
+            let mut unique = Vec::new();
+            for host in hosts {
+                if !unique.contains(host) {
+                    unique.push(*host);
+                }
+            }
+            let hosts = unique
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            include_str!("split-tunnel.sh").replace("@SPLIT_HOSTS@", &hosts)
+        }
         None => VPNC_SCRIPT_TEMPLATE.to_string(),
     };
     let nonce = std::time::SystemTime::now()
@@ -648,7 +667,7 @@ mod tests {
     #[test]
     fn generated_scripts_are_private_and_cleaned_up_independently() {
         let full = generate_vpnc_script(None).unwrap();
-        let split = generate_vpnc_script(Some("203.0.113.10".parse().unwrap())).unwrap();
+        let split = generate_vpnc_script(Some(&["203.0.113.10".parse().unwrap()])).unwrap();
         let full_path = full.path.clone();
         let split_path = split.path.clone();
         assert_ne!(full_path, split_path);
@@ -663,5 +682,19 @@ mod tests {
         assert!(split_path.exists());
         drop(split);
         assert!(!split_path.exists());
+    }
+
+    #[test]
+    fn split_script_requires_hosts_and_deduplicates_them() {
+        assert!(generate_vpnc_script(Some(&[])).is_err());
+        let hosts = [
+            "203.0.113.10".parse().unwrap(),
+            "198.51.100.20".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+        ];
+        let script = generate_vpnc_script(Some(&hosts)).unwrap();
+        let contents = std::fs::read_to_string(&script.path).unwrap();
+        assert!(contents.contains("SPLIT_HOSTS='203.0.113.10 198.51.100.20'"));
+        assert!(!contents.contains("@SPLIT_HOSTS@"));
     }
 }

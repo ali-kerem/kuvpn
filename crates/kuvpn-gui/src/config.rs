@@ -23,7 +23,7 @@ pub struct GuiSettings {
     /// Manual mode uses `vpnc_script` as the script path.
     #[serde(default = "default_tunnel_mode_val")]
     pub tunnel_mode_val: f32,
-    /// IPv4 destination for Split mode. Other traffic and DNS remain local.
+    /// Comma-separated IPv4 addresses or hostnames for Split mode.
     #[serde(default)]
     pub split_host: String,
     /// Path to a custom vpnc-script passed via --script to openconnect (advanced).
@@ -87,12 +87,10 @@ impl GuiSettings {
 
     pub fn tunnel_mode(&self) -> anyhow::Result<kuvpn::TunnelMode> {
         if self.is_split_mode() {
-            let host = self.split_host.trim().parse().map_err(|_| {
-                anyhow::anyhow!(
-                    "Enter the IPv4 address you want to reach through the VPN in Split Host."
-                )
+            let hosts = kuvpn::parse_split_hosts(&self.split_host).map_err(|error| {
+                anyhow::anyhow!("Split Hosts: {error} Separate destinations with commas.")
             })?;
-            Ok(kuvpn::TunnelMode::Split(host))
+            Ok(kuvpn::TunnelMode::Split(hosts))
         } else if self.is_manual_mode() {
             Ok(kuvpn::TunnelMode::Manual(
                 (!self.vpnc_script.is_empty()).then(|| self.vpnc_script.clone()),
@@ -162,11 +160,39 @@ mod tests {
         let mut loaded: GuiSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(
             loaded.tunnel_mode().unwrap(),
-            kuvpn::TunnelMode::Split("203.0.113.10".parse().unwrap())
+            kuvpn::TunnelMode::Split(vec!["203.0.113.10".to_string()])
         );
         loaded.split_host = "not an IP".to_string();
         assert!(loaded.tunnel_mode().is_err());
         loaded.tunnel_mode_val = 1.0;
         assert_eq!(loaded.tunnel_mode().unwrap(), kuvpn::TunnelMode::Full);
+    }
+
+    #[test]
+    fn multiple_split_hosts_persist_trim_and_deduplicate() {
+        let settings = GuiSettings {
+            tunnel_mode_val: 0.0,
+            split_host: "203.0.113.10, SSH.Example.Test,203.0.113.10".to_string(),
+            ..GuiSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let mut loaded: GuiSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            loaded.tunnel_mode().unwrap(),
+            kuvpn::TunnelMode::Split(vec![
+                "203.0.113.10".to_string(),
+                "ssh.example.test".to_string(),
+            ])
+        );
+        for invalid in [
+            "203.0.113.10,",
+            ",203.0.113.10",
+            "203.0.113.10,,198.51.100.20",
+            "203.0.113.10,bad host",
+            "203.0.113.10,::1",
+        ] {
+            loaded.split_host = invalid.to_string();
+            assert!(loaded.tunnel_mode().is_err());
+        }
     }
 }

@@ -15,18 +15,19 @@ pub mod history;
 pub mod logger;
 pub mod openconnect;
 pub mod session;
+pub mod split_hosts;
 pub mod utils;
 
 // Re-export commonly used items
 pub use dsid::{run_login_and_get_dsid, LoginConfig};
 pub use error::{AuthError, ErrorCategory};
+pub use file_logger::FileLogger;
 #[cfg(windows)]
 pub use helper::run_vpn_helper_if_requested;
 pub use history::{
     append_event, clear_events, format_duration_secs, format_timestamp_unix, load_events,
     ConnectionEvent, EventKind,
 };
-pub use file_logger::FileLogger;
 pub use logger::init_logger;
 #[cfg(unix)]
 pub use openconnect::{
@@ -38,4 +39,5 @@ pub use openconnect::{
     kill_process, locate_openconnect, OpenConnectRunner,
 };
 pub use session::{ConnectionStatus, ParsedLog, SessionConfig, TunnelMode, VpnSession};
+pub use split_hosts::{parse_split_host, parse_split_hosts};
 pub use utils::{get_user_data_dir, has_session_data, wipe_user_data_dir};
